@@ -11,6 +11,7 @@ pip install -r requirements.txt
 dépendances système :
 
 winget install Gyan.FFmpeg
+
 winget install DenoLand.Deno
 
 
