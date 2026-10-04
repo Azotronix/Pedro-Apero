@@ -22,10 +22,10 @@ load_dotenv()
 log = logging.getLogger("pedro")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+COOKIES_FILE = os.getenv("YTDL_COOKIES_FILE")
 
 MAX_PLAYLIST_ITEMS = 200
 MAX_QUEUE_SIZE = 1000
-DEFAULT_VOLUME = 100
 DEFAULT_SOURCE = "youtube"
 STREAM_TTL = 300
 HISTORY_SIZE = 50
@@ -111,6 +111,9 @@ def ytdl_options(**extra) -> dict:
         "extractor_retries": 2,
         "source_address": "0.0.0.0",
     }
+    if COOKIES_FILE:
+        opts["cookiefile"] = COOKIES_FILE
+    opts.update(extra)
     return opts
 
 
@@ -212,9 +215,44 @@ async def resolve_stream(track: Track) -> tuple[str, Optional[str]]:
 
 async def resolve_url(url: str, requester: str):
     clean, single = normalize_url(url)
+
+    # Les Mix YouTube (listes dont l'identifiant commence par RD) sont des
+    # playlists dynamiques : le lien pointe vers une vidéo de départ et le
+    # paramètre list contient le Mix généré par YouTube.
+    parsed = urlparse(clean)
+    params = parse_qs(parsed.query)
+    playlist_id = params.get("list", [""])[0]
+    is_mix = playlist_id.upper().startswith("RD")
+
+    if is_mix:
+        params["start_radio"] = ["1"]
+        mix_url = urlunparse((
+            "https",
+            parsed.netloc,
+            parsed.path,
+            "",
+            urlencode(params, doseq=True),
+            "",
+        ))
+        info = await extract(
+            mix_url,
+            noplaylist=False,
+            extract_flat="in_playlist",
+            playlistend=MAX_PLAYLIST_ITEMS,
+        )
+        tracks, title = info_to_tracks(info, requester)
+        if tracks:
+            return tracks, title or "YouTube Mix"
+
+        # Si YouTube/yt-dlp ne renvoie pas le Mix, on garde au moins la vidéo
+        # explicitement présente dans le lien.
+        info = await extract(clean, noplaylist=True)
+        return info_to_tracks(info, requester, with_stream=True)
+
     if single:
         info = await extract(clean, noplaylist=True)
         return info_to_tracks(info, requester, with_stream=True)
+
     info = await extract(clean, noplaylist=False, extract_flat="in_playlist", playlistend=MAX_PLAYLIST_ITEMS)
     return info_to_tracks(info, requester)
 
@@ -256,7 +294,6 @@ class Player:
         self.history: list[Track] = []
         self.current: Optional[Track] = None
         self.loop = LoopMode.OFF
-        self.volume = DEFAULT_VOLUME / 100
         self.controls_message: Optional[discord.Message] = None
 
         self._loop = asyncio.get_running_loop()
@@ -294,7 +331,7 @@ class Player:
         if track.uploader:
             embed.add_field(name="Chaîne", value=esc(track.uploader, 30))
         embed.add_field(name="Boucle", value=LOOP_LABELS[self.loop], inline=False)
-        embed.set_footer(text=f"Volume : {round(self.volume * 100)} % | {len(self.queue)} titre(s) en attente")
+        embed.set_footer(text=f"{len(self.queue)} titre(s) en attente")
         if track.thumbnail:
             embed.set_thumbnail(url=track.thumbnail)
         return embed
@@ -415,12 +452,6 @@ class Player:
         self.loop = modes[(modes.index(self.loop) + 1) % len(modes)]
         return self.loop
 
-    def set_volume(self, percent: int) -> None:
-        self.volume = percent / 100
-        vc = self.guild.voice_client
-        if vc is not None and isinstance(vc.source, discord.PCMVolumeTransformer):
-            vc.source.volume = self.volume
-
     def remove(self, index: int) -> Track:
         self._check_index(index)
         return self.queue.pop(index - 1)
@@ -474,7 +505,7 @@ class Player:
         if user_agent:
             before += f" -user_agent {shlex.quote(user_agent)}"
         source = discord.FFmpegPCMAudio(stream_url, before_options=before, options="-vn")
-        return discord.PCMVolumeTransformer(source, volume=self.volume)
+        return discord.PCMVolumeTransformer(source, volume=1.0)
 
     async def _run(self) -> None:
         while not self._destroyed:
@@ -572,7 +603,7 @@ def build_queue_embed(player: Player, page: int = 1):
     known = [t.duration for t in player.queue if t.duration]
     if known:
         footer += f" | {fmt_duration(sum(known))}"
-    footer += f" | Boucle : {LOOP_LABELS[player.loop]} | Volume : {round(player.volume * 100)} %"
+    footer += f" | Boucle : {LOOP_LABELS[player.loop]}"
     embed.set_footer(text=footer)
     return embed, page, pages
 
@@ -863,12 +894,6 @@ class Music(commands.Cog):
         player = self.existing_player(interaction)
         await interaction.response.send_message("À bientôt.")
         await player.destroy()
-
-    @app_commands.command(name="volume", description="Règle le volume (0 à 150 %)")
-    @app_commands.describe(level="Volume en pourcentage")
-    async def volume(self, interaction: discord.Interaction, level: app_commands.Range[int, 0, 150]):
-        self.existing_player(interaction).set_volume(level)
-        await interaction.response.send_message(f"Volume réglé sur {level} %.")
 
     @app_commands.command(name="queue", description="Affiche la file d'attente")
     @app_commands.describe(page="Numéro de page")
