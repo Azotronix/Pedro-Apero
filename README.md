@@ -15,4 +15,4 @@ winget install Gyan.FFmpeg
 winget install DenoLand.Deno
 
 
-Discord token a complété dans le .env
+Discord token à compléter dans le .env
